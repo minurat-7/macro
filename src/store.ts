@@ -31,6 +31,13 @@ export type GradeResult = {
   selectedIndex: number;
   isCorrect: boolean;
 };
+type QuestionRow = {
+  id: number;
+  questionText: string;
+  choicesJson: string;
+  answerIndex: number;
+  explanation: string;
+};
 
 export class AppStore {
   db: Database.Database;
@@ -185,12 +192,9 @@ export class AppStore {
       .get(userId, date) as AssignmentRow | undefined;
     if (existing) return existing;
 
-    const passage = this.db
-      .prepare(
-        `SELECT p.id FROM Passage p
-         ORDER BY ((p.id + ?) % 997), p.id LIMIT 1`
-      )
-      .get(userId + Number(date.replace(/-/g, ''))) as { id: number };
+    const passageIds = this.db.prepare('SELECT id FROM Passage ORDER BY id').all() as { id: number }[];
+    const dayIndex = Math.floor(Date.parse(`${date}T00:00:00Z`) / (24 * 60 * 60 * 1000));
+    const passage = passageIds[(userId + dayIndex) % passageIds.length];
 
     const created = this.db
       .prepare('INSERT INTO DailyAssignment (userId, passageId, assignedDate) VALUES (?, ?, ?)')
@@ -206,10 +210,10 @@ export class AppStore {
     const passage = this.db
       .prepare('SELECT id, title, sourceYear, sourceExamType, content FROM Passage WHERE id = ?')
       .get(assignment.passageId) as Passage;
-    const questions = this.db
+    const questionRows = this.db
       .prepare('SELECT id, questionText, choicesJson, answerIndex, explanation FROM Question WHERE passageId = ?')
-      .all(assignment.passageId)
-      .map((q: any) => ({
+      .all(assignment.passageId) as QuestionRow[];
+    const questions = questionRows.map((q) => ({
         id: q.id,
         questionText: q.questionText,
         choices: JSON.parse(q.choicesJson),
@@ -327,6 +331,7 @@ export function calculateStreak(completedDates: string[]) {
   if (completedDates.length === 0) return 0;
   const set = new Set(completedDates);
   let streak = 0;
+  // All daily keys are stored and compared in UTC (YYYY-MM-DD).
   const cursor = new Date();
   while (true) {
     const y = cursor.getUTCFullYear();

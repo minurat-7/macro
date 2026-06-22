@@ -3,6 +3,7 @@ import session from 'express-session';
 import bcrypt from 'bcryptjs';
 import path from 'path';
 import fs from 'fs';
+import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { AppStore, gradeAnswers } from './store.js';
 
@@ -10,6 +11,7 @@ declare module 'express-session' {
   interface SessionData {
     userId?: number;
     userName?: string;
+    csrfToken?: string;
   }
 }
 
@@ -19,11 +21,17 @@ const app = express();
 const dataDir = path.resolve(__dirname, '../data');
 fs.mkdirSync(dataDir, { recursive: true });
 const store = new AppStore(path.join(dataDir, 'app.db'));
+const MAX_TIME_SECONDS = 60 * 60 * 3;
+const MAX_TEXT_LENGTH = 2000;
+const sessionSecret = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
+if (process.env.NODE_ENV === 'production' && !process.env.SESSION_SECRET) {
+  throw new Error('SESSION_SECRET is required in production');
+}
 
 app.use(express.urlencoded({ extended: false }));
 app.use(
   session({
-    secret: process.env.SESSION_SECRET || 'replace-with-env-secret',
+    secret: sessionSecret,
     resave: false,
     saveUninitialized: false,
     cookie: {
@@ -34,6 +42,22 @@ app.use(
     }
   })
 );
+app.use((req, _res, next) => {
+  if (!req.session.csrfToken) {
+    req.session.csrfToken = crypto.randomBytes(24).toString('hex');
+  }
+  next();
+});
+app.use((req, res, next) => {
+  if (req.method === 'POST') {
+    const token = String(req.body._csrf ?? '');
+    if (!token || token !== req.session.csrfToken) {
+      res.status(403).send(page('오류', '<p>유효하지 않은 요청입니다.</p><a href=\"/\">돌아가기</a>'));
+      return;
+    }
+  }
+  next();
+});
 
 function escapeHtml(v: string) {
   return v
@@ -46,6 +70,10 @@ function escapeHtml(v: string) {
 
 function today() {
   return new Date().toISOString().slice(0, 10);
+}
+
+function csrfInput(req: express.Request) {
+  return `<input type="hidden" name="_csrf" value="${req.session.csrfToken ?? ''}" />`;
 }
 
 function requireAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
@@ -92,6 +120,7 @@ app.get('/', (req, res) => {
          <div class="card" style="flex:1;min-width:260px;">
            <h3>회원가입</h3>
            <form method="post" action="/auth/signup">
+             ${csrfInput(req)}
              <label>이름</label><input name="name" required maxlength="30" />
              <label>이메일</label><input name="email" type="email" required />
              <label>비밀번호</label><input name="password" type="password" minlength="6" required />
@@ -101,6 +130,7 @@ app.get('/', (req, res) => {
          <div class="card" style="flex:1;min-width:260px;">
            <h3>로그인</h3>
            <form method="post" action="/auth/login">
+             ${csrfInput(req)}
              <label>이메일</label><input name="email" type="email" required />
              <label>비밀번호</label><input name="password" type="password" required />
              <button type="submit">로그인</button>
@@ -162,7 +192,7 @@ app.get('/home', requireAuth, (req, res) => {
       '홈',
       `<div class="row" style="justify-content:space-between;align-items:center;">
          <h1>안녕하세요, ${escapeHtml(req.session.userName ?? '사용자')}님</h1>
-         <form method="post" action="/auth/logout"><button type="submit">로그아웃</button></form>
+         <form method="post" action="/auth/logout">${csrfInput(req)}<button type="submit">로그아웃</button></form>
        </div>
        <div class="card">
          <h2>오늘의 지문 (${daily.assignment.assignedDate})</h2>
@@ -209,6 +239,7 @@ app.get('/solve', requireAuth, (req, res) => {
       `<h1>${escapeHtml(daily.passage.title)}</h1>
        <div class="card"><p style="line-height:1.8;white-space:pre-wrap;">${escapeHtml(daily.passage.content)}</p></div>
        <form method="post" action="/solve">
+         ${csrfInput(req)}
          <input type="hidden" name="startedAt" value="${Date.now()}" />
          ${questionHtml}
          <button type="submit">제출하기</button>
@@ -234,7 +265,7 @@ app.post('/solve', requireAuth, (req, res) => {
 
   const startedAt = Number(req.body.startedAt);
   const elapsed = Number.isFinite(startedAt) ? Math.floor((Date.now() - startedAt) / 1000) : 0;
-  const timeSpent = Math.max(0, Math.min(60 * 60 * 3, elapsed));
+  const timeSpent = Math.max(0, Math.min(MAX_TIME_SECONDS, elapsed));
 
   const graded = gradeAnswers(daily.questions, answers);
   store.submitAnswers(userId, daily.assignment.id, graded, timeSpent);
@@ -293,6 +324,7 @@ app.get('/analysis', requireAuth, (req, res) => {
        <div class="card">
          <p><strong>${escapeHtml(daily.passage.title)}</strong></p>
          <form method="post" action="/analysis">
+           ${csrfInput(req)}
            <label>메모</label><textarea name="memo" rows="4">${value(analysis?.memo)}</textarea>
            <label>핵심 주장</label><input name="mainIdea" value="${value(analysis?.mainIdea)}" />
            <label>근거 문장</label><textarea name="evidence" rows="3">${value(analysis?.evidence)}</textarea>
@@ -310,7 +342,7 @@ app.get('/analysis', requireAuth, (req, res) => {
 app.post('/analysis', requireAuth, (req, res) => {
   const userId = req.session.userId!;
   const daily = store.getDailyResult(userId, today());
-  const toText = (v: unknown) => String(v ?? '').slice(0, 2000);
+  const toText = (v: unknown) => String(v ?? '').slice(0, MAX_TEXT_LENGTH);
   store.upsertAnalysis(userId, daily.passage.id, {
     memo: toText(req.body.memo),
     mainIdea: toText(req.body.mainIdea),
